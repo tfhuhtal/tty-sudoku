@@ -5,10 +5,12 @@ from __future__ import annotations
 import curses
 import random
 import time
+from dataclasses import dataclass
 
 from .board import (
     CELLS,
     DIFFICULTIES,
+    PEERS,
     SIZE,
     Difficulty,
     candidates,
@@ -19,36 +21,96 @@ from .board import (
 MIN_HEIGHT = 22
 MIN_WIDTH = 40
 
-BORDER_TOP = "┌───────┬───────┬───────┐"
-BORDER_MID = "├───────┼───────┼───────┤"
-BORDER_BOTTOM = "└───────┴───────┴───────┘"
-BORDER_ROW = "│       │       │       │"
+
+@dataclass(frozen=True)
+class Frame:
+    top: str
+    mid: str
+    bottom: str
+    row: str
+    note: str
+
+
+# Some terminal fonts lack the box-drawing glyphs (a missing U+2500 collapses the
+# whole border), so ASCII is the default and Unicode is opt-in.
+FRAMES: dict[str, Frame] = {
+    "ascii": Frame(
+        top="+-------+-------+-------+",
+        mid="+-------+-------+-------+",
+        bottom="+-------+-------+-------+",
+        row="|       |       |       |",
+        note="*",
+    ),
+    "unicode": Frame(
+        top="┌───────┬───────┬───────┐",
+        mid="├───────┼───────┼───────┤",
+        bottom="└───────┴───────┴───────┘",
+        row="│       │       │       │",
+        note="·",
+    ),
+}
 
 GRID_Y = 3
 GRID_X = 3
-GRID_W = len(BORDER_TOP)
+GRID_W = len(FRAMES["ascii"].top)
 
 CLR_FRAME = 1
-CLR_GIVEN = 2
-CLR_ENTRY = 3
-CLR_BAD = 4
-CLR_CURSOR = 5
-CLR_PEER = 6
-CLR_TITLE = 7
-CLR_WIN = 8
+CLR_CURSOR = 2
+CLR_MESSAGE = 3
+CLR_TITLE = 4
+CLR_WIN = 5
+
+CELL_KINDS: dict[str, tuple[int, int]] = {
+    "given": (curses.COLOR_WHITE, curses.A_BOLD),
+    "entry": (curses.COLOR_CYAN, 0),
+    "bad": (curses.COLOR_RED, curses.A_BOLD),
+    "empty": (-1, curses.A_DIM),
+}
 
 
-def _init_colors() -> None:
+@dataclass(frozen=True)
+class Theme:
+    frame: Frame
+    cell: dict[tuple[str, bool], int]
+    cursor: int
+    band: int | None
+
+    @property
+    def has_band(self) -> bool:
+        return self.band is not None
+
+
+def _build_theme(style: str) -> Theme:
     curses.start_color()
     curses.use_default_colors()
     curses.init_pair(CLR_FRAME, curses.COLOR_BLUE, -1)
-    curses.init_pair(CLR_GIVEN, curses.COLOR_WHITE, -1)
-    curses.init_pair(CLR_ENTRY, curses.COLOR_CYAN, -1)
-    curses.init_pair(CLR_BAD, curses.COLOR_RED, -1)
     curses.init_pair(CLR_CURSOR, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-    curses.init_pair(CLR_PEER, curses.COLOR_YELLOW, -1)
+    curses.init_pair(CLR_MESSAGE, curses.COLOR_YELLOW, -1)
     curses.init_pair(CLR_TITLE, curses.COLOR_MAGENTA, -1)
     curses.init_pair(CLR_WIN, curses.COLOR_GREEN, -1)
+
+    if curses.COLORS >= 256:
+        band_bg = 237
+    elif curses.COLORS >= 16:
+        band_bg = 8
+    else:
+        band_bg = None
+
+    cell: dict[tuple[str, bool], int] = {}
+    pair = CLR_WIN + 1
+    for kind, (fg, extra) in CELL_KINDS.items():
+        curses.init_pair(pair, fg, -1)
+        cell[(kind, False)] = curses.color_pair(pair) | extra
+        pair += 1
+        if band_bg is None:
+            cell[(kind, True)] = cell[(kind, False)] | curses.A_UNDERLINE
+        else:
+            curses.init_pair(pair, fg, band_bg)
+            cell[(kind, True)] = curses.color_pair(pair) | extra
+            pair += 1
+
+    band = cell[("empty", True)] if band_bg is not None else None
+    return Theme(FRAMES[style], cell, curses.color_pair(CLR_CURSOR) | curses.A_BOLD, band)
 
 
 def _put(win: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -79,7 +141,6 @@ class Game:
         self.notes: list[set[int]] = [set() for _ in range(CELLS)]
         self.cursor = self.puzzle.index(0) if 0 in self.puzzle else 0
         self.undo: list[tuple[int, int, set[int]]] = []
-        self.hints = 0
         self.notes_mode = False
         self.mark_mistakes = False
         self.started = time.monotonic()
@@ -122,17 +183,6 @@ class Game:
         self.grid[index] = 0
         self.notes[index].clear()
 
-    def hint(self) -> None:
-        index = self.cursor
-        if self.grid[index] == self.solution[index]:
-            self.message = "Already correct."
-            return
-        self._record(index)
-        self.grid[index] = self.solution[index]
-        self.notes[index].clear()
-        self.hints += 1
-        self._check_finished()
-
     def undo_last(self) -> None:
         if not self.undo:
             self.message = "Nothing to undo."
@@ -147,46 +197,59 @@ class Game:
             self.finished = time.monotonic()
 
 
-def _draw_frame(win: curses.window) -> None:
-    frame = curses.color_pair(CLR_FRAME)
-    lines = [BORDER_TOP] + ([BORDER_ROW] * 3 + [BORDER_MID]) * 2 + [BORDER_ROW] * 3
-    lines.append(BORDER_BOTTOM)
+def _draw_frame(win: curses.window, frame: Frame) -> None:
+    attr = curses.color_pair(CLR_FRAME)
+    lines = [frame.top] + ([frame.row] * 3 + [frame.mid]) * 2 + [frame.row] * 3
+    lines.append(frame.bottom)
     for offset, line in enumerate(lines):
-        _put(win, GRID_Y + offset, GRID_X, line, frame)
+        _put(win, GRID_Y + offset, GRID_X, line, attr)
 
 
-def _draw_game(win: curses.window, game: Game) -> None:
+def _cell_kind(game: Game, index: int, bad: set[int]) -> str:
+    if not game.grid[index]:
+        return "empty"
+    if index in bad or (
+        game.mark_mistakes and game.grid[index] != game.solution[index]
+    ):
+        return "bad"
+    return "given" if game.puzzle[index] else "entry"
+
+
+def _draw_game(win: curses.window, game: Game, theme: Theme) -> None:
+    frame = theme.frame
     win.erase()
     _put(win, 0, GRID_X, "TTY SUDOKU", curses.color_pair(CLR_TITLE) | curses.A_BOLD)
-    status = f"{_mmss(game.elapsed)}  hints {game.hints}"
+    status = _mmss(game.elapsed)
     _put(win, 0, GRID_X + GRID_W - len(status), status, curses.A_DIM)
     mode = "notes" if game.notes_mode else "entry"
     if game.mark_mistakes:
         mode += " · check"
     _put(win, 1, GRID_X, f"{game.difficulty.name.lower()} · {mode}", curses.A_DIM)
 
-    _draw_frame(win)
+    _draw_frame(win, frame)
 
     bad = conflicts(game.grid)
     cursor_row, cursor_col = divmod(game.cursor, SIZE)
+    band = set(PEERS[game.cursor]) | {game.cursor}
+
+    # The band is laid down first so that each cell's padding is part of it.
+    if theme.has_band:
+        for index in sorted(band):
+            row, col = divmod(index, SIZE)
+            _put(win, _cell_y(row), _cell_x(col) - 1, "   ", theme.band)
+    _put(win, _cell_y(cursor_row), _cell_x(cursor_col) - 1, "   ", theme.cursor)
+
     for index in range(CELLS):
         row, col = divmod(index, SIZE)
-        value = game.grid[index]
-        if value:
-            char = str(value)
-            if index in bad or (game.mark_mistakes and value != game.solution[index]):
-                attr = curses.color_pair(CLR_BAD) | curses.A_BOLD
-            elif game.puzzle[index]:
-                attr = curses.color_pair(CLR_GIVEN) | curses.A_BOLD
-            else:
-                attr = curses.color_pair(CLR_ENTRY)
+        kind = _cell_kind(game, index, bad)
+        if kind == "empty":
+            char = frame.note if game.notes[index] else " "
         else:
-            char = "·" if game.notes[index] else " "
-            attr = curses.A_DIM
+            char = str(game.grid[index])
         if index == game.cursor:
-            attr = curses.color_pair(CLR_CURSOR) | curses.A_BOLD
-        elif row == cursor_row or col == cursor_col:
-            attr |= curses.A_UNDERLINE
+            attr = theme.cursor
+        else:
+            attr = theme.cell[(kind, index in band)]
         _put(win, _cell_y(row), _cell_x(col), char, attr)
 
     panel_y = GRID_Y + 14
@@ -202,13 +265,13 @@ def _draw_game(win: curses.window, game: Game) -> None:
     )
 
     if game.solved:
-        won = f"Solved in {_mmss(game.elapsed)} with {game.hints} hint(s)!"
+        won = f"Solved in {_mmss(game.elapsed)}!"
         _put(win, panel_y + 1, GRID_X, won, curses.color_pair(CLR_WIN) | curses.A_BOLD)
         _put(win, panel_y + 2, GRID_X, "n new puzzle · d difficulty · q quit", curses.A_DIM)
     else:
-        _put(win, panel_y + 1, GRID_X, game.message, curses.color_pair(CLR_PEER))
+        _put(win, panel_y + 1, GRID_X, game.message, curses.color_pair(CLR_MESSAGE))
         _put(win, panel_y + 2, GRID_X, "hjkl/arrows move · 1-9 place · 0 erase · p notes", curses.A_DIM)
-        _put(win, panel_y + 3, GRID_X, "u undo · ? hint · m check · n new · d difficulty · q quit", curses.A_DIM)
+        _put(win, panel_y + 3, GRID_X, "u undo · m check · n new · d difficulty · q quit", curses.A_DIM)
     win.noutrefresh()
     curses.doupdate()
 
@@ -250,10 +313,10 @@ def _loading(win: curses.window, difficulty: Difficulty) -> None:
     win.refresh()
 
 
-def _play(win: curses.window, game: Game) -> str:
+def _play(win: curses.window, game: Game, theme: Theme) -> str:
     """Run one puzzle; returns 'new', 'menu' or 'quit'."""
     while True:
-        _draw_game(win, game)
+        _draw_game(win, game, theme)
         key = win.getch()
         if key == -1:
             continue
@@ -281,17 +344,20 @@ def _play(win: curses.window, game: Game) -> str:
             game.notes_mode = not game.notes_mode
         elif key == ord("u"):
             game.undo_last()
-        elif key == ord("?"):
-            game.hint()
         elif key == ord("m"):
             game.mark_mistakes = not game.mark_mistakes
         elif key == curses.KEY_RESIZE:
             win.clear()
 
 
-def run(stdscr: curses.window, seed: int | None, difficulty: Difficulty | None) -> None:
+def run(
+    stdscr: curses.window,
+    seed: int | None,
+    difficulty: Difficulty | None,
+    style: str,
+) -> None:
     curses.curs_set(0)
-    _init_colors()
+    theme = _build_theme(style)
     stdscr.keypad(True)
     curses.halfdelay(5)
     rng = random.Random(seed)
@@ -312,7 +378,7 @@ def run(stdscr: curses.window, seed: int | None, difficulty: Difficulty | None) 
             if difficulty is None:
                 return
         _loading(stdscr, difficulty)
-        action = _play(stdscr, Game(difficulty, rng))
+        action = _play(stdscr, Game(difficulty, rng), theme)
         if action == "quit":
             return
         if action == "menu":
