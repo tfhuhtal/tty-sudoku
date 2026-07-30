@@ -13,7 +13,6 @@ from .board import (
     PEERS,
     SIZE,
     Difficulty,
-    candidates,
     conflicts,
     generate,
 )
@@ -254,14 +253,12 @@ def _draw_game(win: curses.window, game: Game, theme: Theme) -> None:
 
     panel_y = GRID_Y + 14
     notes = game.notes[game.cursor]
-    possible = candidates(game.grid, game.cursor) if not game.grid[game.cursor] else []
     _put(
         win,
         panel_y,
         GRID_X,
         f"cell {chr(ord('A') + cursor_row)}{cursor_col + 1}"
-        f"  notes {''.join(str(d) for d in sorted(notes)) or '-'}"
-        f"  fits {''.join(str(d) for d in possible) or '-'}",
+        f"  notes {''.join(str(d) for d in sorted(notes)) or '-'}",
     )
 
     if game.solved:

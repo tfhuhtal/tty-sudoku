@@ -20,7 +20,7 @@ A sudoku game that runs in the terminal. Pure Python + `curses`, no dependencies
    | 5     |   8   | 2     |
    +-------+-------+-------+
 
-   cell D4  notes -  fits 2357
+   cell D4  notes -
 ```
 
 ## Run
@@ -65,5 +65,4 @@ Given digits are bold white, your entries cyan, and digits that clash within a
 row, column or box turn red. The cursor's row, column and box are shaded so the
 cell you are working on is easy to place; on terminals with fewer than 16 colours
 the shading falls back to underlining. The panel under the grid shows the pencil
-marks for the current cell plus the digits that still fit there; cells holding
-pencil marks are drawn as a dim `*`.
+marks for the current cell; cells holding pencil marks are drawn as a dim `*`.
